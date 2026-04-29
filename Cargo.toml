@@ -13,3 +13,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0" # Pour transformer nos blocs en texte pour le réseau
 tokio = { version = "1.41", features = ["full"] } # Le moteur réseau asynchrone
 bip39 = { version = "2.2.2", features = ["french"] }
+reqwest = { version = "0.11", features = ["json"] }
+warp = "0.3"
+num-bigint = "0.4" # 🎯 POUR GÉRER LES NOMBRES À 78 CHIFFRES
+curve25519-dalek = "4.0"
+randomx-rs = "1.2" # La librairie officielle
+blake3 = "1.8.4"
+pqcrypto-dilithium = "0.5.0"
+pqcrypto-kyber = "0.8.1"
+pqcrypto-traits = "0.3.5"
