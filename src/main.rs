@@ -144,12 +144,13 @@ async fn main() {
                 if candidate_block.header.nonce % 2000 == 0 {
                     let chain = shared_chain.lock().unwrap();
                     
-                    // 💡 FIX : On vérifie si la chaîne est plus grande OU ÉGALE à notre index
-                    // (Si elle est plus grande, c'est qu'une synchro P2P a eu lieu)
+                    // 💡 LA SEULE VRAIE VÉRIFICATION : Si la taille de la chaîne dépasse notre index,
+                    // c'est qu'un concurrent a publié un bloc (ou qu'on a reçu une synchro massive) !
                     if chain.chain.len() as u64 > candidate_block.header.index {
-                        println!("🛑 [ALERTE] Le réseau a été mis à jour pendant notre calcul ! Annulation du minage.");
+                        println!("🛑 [ALERTE] Le réseau a trouvé le Bloc {} avant nous ! Annulation du minage.", candidate_block.header.index);
                         break; 
                     }
+                    
                     tokio::task::yield_now().await;
                 }
 

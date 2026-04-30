@@ -92,14 +92,29 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                         let new_work = Blockchain::calculate_total_work(&blocks);
                         
                         if new_work > my_work {
-                            println!("⚖️ Le Juge a pesé : La nouvelle chaîne est plus LOURDE !");
+                            println!("⚖️ Le Juge a pesé : La nouvelle chaîne est plus LOURDE (Poids supérieur) !");
                             if chain.resolve_fork(blocks) {
                                 println!("✅ Synchronisation réussie ! Nous sommes à jour.");
                             } else {
-                                println!("❌ Chaîne massive rejetée par le Juge.");
+                                println!("❌ Chaîne massive rejetée par le Juge (Invalide).");
+                            }
+                        } else if new_work == my_work && blocks.len() > 0 && chain.chain.len() > 0 {
+                            // 💡 NOUVEAU FIX : Égalité parfaite de poids ! On départage avec le chronomètre.
+                            let my_last_time = chain.chain.last().unwrap().header.timestamp;
+                            let new_last_time = blocks.last().unwrap().header.timestamp;
+                            
+                            if new_last_time < my_last_time {
+                                println!("⏱️ Égalité de poids, mais la chaîne concurrente a été minée AVANT la nôtre ! On l'adopte.");
+                                if chain.resolve_fork(blocks) {
+                                    println!("✅ Synchronisation réussie ! Nous sommes à jour.");
+                                } else {
+                                    println!("❌ Chaîne concurrente rejetée par le Juge (Invalide).");
+                                }
+                            } else {
+                                println!("🛡️ Égalité parfaite, mais notre chaîne a été minée avant (ou en même temps). On garde la nôtre !");
                             }
                         } else {
-                            println!("🛡️ Chaîne massive ignorée : Notre chaîne est plus lourde ou égale !");
+                            println!("🛡️ Chaîne massive ignorée : Notre chaîne est plus lourde !");
                         }
                     },
 
