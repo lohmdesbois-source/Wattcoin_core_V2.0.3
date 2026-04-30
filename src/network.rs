@@ -90,6 +90,7 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                         }
                     },
                     
+                    // 📥 RÉCEPTION DE SYNCHRONISATION
                     P2PMessage::SyncResponse { blocks } => {
                         let mut chain = blockchain_clone.lock().unwrap(); 
                         println!("📦 [P2P] Réception d'une synchronisation massive ({} blocs) !", blocks.len());
@@ -97,10 +98,14 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                         let my_work = Blockchain::calculate_total_work(&chain.chain);
                         let new_work = Blockchain::calculate_total_work(&blocks);
                         
+                        // Variable pour savoir si on a accepté la nouvelle chaîne
+                        let mut chain_accepted = false; 
+                        
                         if new_work > my_work {
                             println!("⚖️ Le Juge a pesé : La nouvelle chaîne est plus LOURDE (Poids supérieur) !");
-                            if chain.resolve_fork(blocks) {
+                            if chain.resolve_fork(blocks.clone()) { // On clone pour pouvoir nettoyer le mempool après
                                 println!("✅ Synchronisation réussie ! Nous sommes à jour.");
+                                chain_accepted = true;
                             } else {
                                 println!("❌ Chaîne massive rejetée par le Juge (Invalide).");
                             }
@@ -110,8 +115,9 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                             
                             if new_last_time < my_last_time {
                                 println!("⏱️ Égalité de poids, mais la chaîne concurrente a été minée AVANT la nôtre ! On l'adopte.");
-                                if chain.resolve_fork(blocks) {
+                                if chain.resolve_fork(blocks.clone()) {
                                     println!("✅ Synchronisation réussie ! Nous sommes à jour.");
+                                    chain_accepted = true;
                                 } else {
                                     println!("❌ Chaîne concurrente rejetée par le Juge (Invalide).");
                                 }
@@ -121,10 +127,24 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                         } else {
                             println!("🛡️ Chaîne massive ignorée : Notre chaîne est plus lourde !");
                         }
+                        
+                        // 🧹 LE GRAND NETTOYAGE : Si on a adopté une nouvelle chaîne, on vide les transactions
+                        // de notre Mempool qui sont DÉJÀ dans cette nouvelle chaîne !
+                        if chain_accepted {
+                            let mut mp = mempool_clone.lock().unwrap();
+                            let initial_len = mp.len();
+                            mp.retain(|tx| {
+                                // On garde la transaction SEULEMENT SI elle n'est dans aucun des nouveaux blocs
+                                !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == tx.kyber_capsule))
+                            });
+                            let removed = initial_len - mp.len();
+                            if removed > 0 {
+                                println!("🧹 [MEMPOOL] Nettoyage massif après synchro. {} TX retirée(s).", removed);
+                            }
+                        }
                     },
 
                     P2PMessage::NewBlock { block, sender_port } => {
-                        // 📖 On enregistre ce mineur dans notre carnet !
                         let full_addr = format!("{}:{}", peer_ip, sender_port);
                         peers_clone.lock().unwrap().insert(full_addr);
 
@@ -147,8 +167,14 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                             if let Some(P2PMessage::SyncResponse { blocks }) = read_p2p_message(&mut socket).await {
                                 println!("📦 [P2P] Réception de la chaîne de rattrapage ({} blocs) !", blocks.len());
                                 let mut chain = blockchain_clone.lock().unwrap(); 
-                                if chain.resolve_fork(blocks) {
+                                if chain.resolve_fork(blocks.clone()) { // 💡 FIX : On clone 'blocks' ici
                                     println!("✅ [P2P] Synchronisation de rattrapage réussie !");
+                                    
+                                    // 🧹 NETTOYAGE ICI AUSSI !
+                                    let mut mp = mempool_clone.lock().unwrap();
+                                    mp.retain(|tx| {
+                                        !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == tx.kyber_capsule))
+                                    });
                                 }
                             }
                         } else if process_block {
@@ -160,10 +186,12 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                                 println!("   🚨 BLOC REJETÉ : {}", e);
                             } else {
                                 let mut mp = mempool_clone.lock().unwrap();
+                                let initial_len = mp.len();
                                 mp.retain(|tx| {
                                     !block_to_clean.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == tx.kyber_capsule)
                                 });
-                                println!("🧹 [MEMPOOL] Nettoyé suite au bloc d'un pair. TX restantes : {}", mp.len());
+                                let removed = initial_len - mp.len();
+                                println!("🧹 [MEMPOOL] Nettoyé suite au bloc d'un pair. TX retirées : {}, restantes : {}", removed, mp.len());
                             }
                         }
                     },
