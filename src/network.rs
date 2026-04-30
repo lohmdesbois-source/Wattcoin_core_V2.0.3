@@ -100,7 +100,6 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
 
                             // 🧱 RÉCEPTION D'UN BLOC EN DIRECT
                             P2PMessage::NewBlock { block, sender_port: _ } => {
-                                // 1. On prend le verrou juste pour analyser la situation
                                 let (needs_sync, my_genesis, my_height, process_block) = {
                                     let chain = blockchain_clone.lock().unwrap(); // 🔒 Verrou local
                                     let my_height = chain.chain.len() as u64;
@@ -116,7 +115,10 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                                     let envelope = P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port_clone.clone() };
                                     let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
                                     
-                                    // On attend la réponse (la blockchain complète) qui va revenir instantanément
+                                    // ⏱️ NOUVEAU : On donne 1 seconde au mineur pour nous renvoyer la lourde blockchain !
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                                    
+                                    // On attend la réponse (la blockchain complète) qui va revenir
                                     if let Ok(n2) = socket.read(&mut buffer).await {
                                         if n2 > 0 {
                                             let response_str = String::from_utf8_lossy(&buffer[..n2]);
