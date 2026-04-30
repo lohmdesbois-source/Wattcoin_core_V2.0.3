@@ -99,22 +99,42 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                             },
 
                             // 🧱 RÉCEPTION D'UN BLOC EN DIRECT
-                            P2PMessage::NewBlock { block, sender_port } => {
-                                let mut chain = blockchain_clone.lock().unwrap(); // 🔒 Verrou local
-                                let my_height = chain.chain.len() as u64;
-                                if block.header.index > my_height {
-                                    println!("⏩ [P2P] Bloc du futur reçu ({}). Demande de mise à jour !", block.header.index);
+                            P2PMessage::NewBlock { block, sender_port: _ } => {
+                                // 1. On prend le verrou juste pour analyser la situation
+                                let (needs_sync, my_genesis, my_height, process_block) = {
+                                    let chain = blockchain_clone.lock().unwrap(); // 🔒 Verrou local
+                                    let my_height = chain.chain.len() as u64;
                                     let my_genesis = chain.chain[0].header.hash.clone();
-                                    let port_for_sync = my_port_clone.clone();
-                                    let p2p_chain_sync = Arc::clone(&blockchain_clone);
                                     
-                                    tokio::spawn(async move {
-                                        send_handshake(&sender_port, &port_for_sync, my_genesis, my_height, p2p_chain_sync).await;
-                                    });
-                                } else if block.header.index == my_height {
+                                    (block.header.index > my_height, my_genesis, my_height, block.header.index == my_height)
+                                }; // 🔓 Le verrou saute ici ! On peut maintenant utiliser le réseau.
+                                
+                                if needs_sync {
+                                    println!("⏩ [P2P] Bloc du futur reçu ({}). Demande de mise à jour !", block.header.index);
+                                    
+                                    // 💡 FIX NAT (Serveur) : On demande la mise à jour DANS LE MÊME TUYAU TCP !
+                                    let envelope = P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port_clone.clone() };
+                                    let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
+                                    
+                                    // On attend la réponse (la blockchain complète) qui va revenir instantanément
+                                    if let Ok(n2) = socket.read(&mut buffer).await {
+                                        if n2 > 0 {
+                                            let response_str = String::from_utf8_lossy(&buffer[..n2]);
+                                            if let Ok(P2PMessage::SyncResponse { blocks }) = serde_json::from_str::<P2PMessage>(&response_str) {
+                                                println!("📦 [P2P] Réception de la chaîne de rattrapage ({} blocs) !", blocks.len());
+                                                
+                                                let mut chain = blockchain_clone.lock().unwrap(); // 🔒 On reprend le verrou pour écrire
+                                                if chain.resolve_fork(blocks) {
+                                                    println!("✅ [P2P] Synchronisation de rattrapage réussie !");
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if process_block {
                                     println!("\n🌍 [P2P] Nouveau BLOC {} reçu en direct !", block.header.index);
                                     let block_to_clean = block.clone(); 
 
+                                    let mut chain = blockchain_clone.lock().unwrap(); // 🔒 On reprend le verrou pour écrire
                                     if let Err(e) = chain.validate_and_add_external_block(block) {
                                         println!("   🚨 BLOC REJETÉ : {}", e);
                                     } else {
@@ -169,12 +189,33 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
 }
 
 // --- FONCTIONS RÉSEAU D'ENVOI ---
-
-pub async fn broadcast_block(target_peer: &str, my_port: &str, block: Block) {
+// 💡 FIX NAT (Mineur) : Ajout de l'accès à la blockchain + Sécurité Send
+pub async fn broadcast_block(target_peer: &str, my_port: &str, block: Block, blockchain: Arc<Mutex<Blockchain>>) {
     let address = format_peer_address(target_peer);
     if let Ok(mut stream) = TcpStream::connect(&address).await {
         let envelope = P2PMessage::NewBlock { block, sender_port: my_port.to_string() };
         let _ = stream.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
+
+        // 💡 On écoute 1 seconde au cas où le serveur pleurerait qu'il est en retard
+        let mut buffer = vec![0; 1024 * 1024 * 10]; // 10 Mo
+        if let Ok(n) = stream.read(&mut buffer).await {
+            if n > 0 {
+                let message_str = String::from_utf8_lossy(&buffer[..n]);
+                if let Ok(P2PMessage::Handshake { current_height, .. }) = serde_json::from_str::<P2PMessage>(&message_str) {
+                    println!("📡 [NAT] Le serveur est en retard (Hauteur: {}). Envoi de la blockchain complète...", current_height);
+                    
+                    // 1. On clone la chaîne tout de suite et on lâche le verrou
+                    let blocks_to_send = {
+                        let chain = blockchain.lock().unwrap();
+                        chain.chain.clone()
+                    }; // 🔓 Le verrou saute ici !
+
+                    // 2. On attend tranquillement l'envoi réseau sans bloquer le programme
+                    let envelope_sync = P2PMessage::SyncResponse { blocks: blocks_to_send };
+                    let _ = stream.write_all(serde_json::to_string(&envelope_sync).unwrap().as_bytes()).await;
+                }
+            }
+        }
     }
 }
 
@@ -202,13 +243,6 @@ pub async fn send_handshake(target_peer: &str, my_port: &str, genesis_hash: Stri
     }
 }
 
-pub async fn send_sync_response(target_peer: &str, blocks: Vec<Block>) {
-    let address = format_peer_address(target_peer);
-    if let Ok(mut stream) = TcpStream::connect(&address).await {
-        let envelope = P2PMessage::SyncResponse { blocks };
-        let _ = stream.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
-    }
-}
 
 pub async fn broadcast_transaction(target_peer: &str, tx: Transaction) {
     let address = format_peer_address(target_peer);

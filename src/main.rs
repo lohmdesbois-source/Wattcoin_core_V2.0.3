@@ -201,12 +201,18 @@ async fn main() {
                     chain.update_target(); 
                     chain.save_to_disk(&db_file);
 
+                    // 💡 LA CORRECTION peer_target EST BIEN LÀ !
                     if let Some(target_port) = &peer_target {
                         let target_clone = target_port.clone();
                         let block_clone = candidate_block.clone();
                         let my_port_clone = port.clone(); 
+                        
+                        // 💡 NOUVEAU : On donne une copie de la chaîne au réseau pour pouvoir la partager
+                        let p2p_chain_broadcast = Arc::clone(&shared_chain); 
+                        
                         tokio::spawn(async move {
-                            network::broadcast_block(&target_clone, &my_port_clone, block_clone).await;
+                            // On ajoute p2p_chain_broadcast à la fin
+                            network::broadcast_block(&target_clone, &my_port_clone, block_clone, p2p_chain_broadcast).await;
                         });
                     }
                 }
