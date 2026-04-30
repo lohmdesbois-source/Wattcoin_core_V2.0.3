@@ -85,12 +85,17 @@ impl Blockchain {
         let mut valid_transactions = Vec::new();
 		let mut total_fees = 0; // 💰 NOUVEAU : La cagnotte du mineur
 
-        // Filtre des transactions : On ne vérifie plus les montants (le nœud est aveugle), seulement les signatures !
+        // Filtre des transactions : On vérifie la signature ET la double dépense !
         for tx in transactions {
             if tx.is_valid() { 
-                println!("💸 Transaction détectée ! (Pourboire: {} Flames)", tx.fee);
-                total_fees += tx.fee; // On ajoute le pourboire à la cagnotte
-                valid_transactions.push(tx); 
+                // 💡 FIX : Le Mineur regarde son propre registre noir avant d'accepter la TX !
+                if !self.spent_key_images.contains(&tx.kyber_capsule) {
+                    println!("💸 Transaction détectée ! (Pourboire: {} Flames)", tx.fee);
+                    total_fees += tx.fee; 
+                    valid_transactions.push(tx); 
+                } else {
+                    println!("🗑️ Transaction ignorée par le mineur (Déjà dépensée).");
+                }
             }
         }
         
@@ -208,7 +213,19 @@ impl Blockchain {
         }
 
         self.chain = new_chain;
-        self.recalculate_target_from_scratch(); // 🎯 LE VRAI FIX EST ICI ! Le nœud recalcule TOUT.
+        self.recalculate_target_from_scratch(); 
+        
+        // 💡 FIX : RECONSTRUCTION DU REGISTRE NOIR APRÈS UN FORK !
+        let mut new_spent = HashSet::new();
+        for block in &self.chain {
+            for tx in &block.transactions {
+                if !tx.stealth_address.starts_with("COINBASE_") && tx.stealth_address != "GENESIS" {
+                    new_spent.insert(tx.kyber_capsule.clone());
+                }
+            }
+        }
+        self.spent_key_images = new_spent;
+
         true
     }
     

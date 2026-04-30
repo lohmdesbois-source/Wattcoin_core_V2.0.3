@@ -181,6 +181,13 @@ async fn main() {
                     println!("💰 Frais perçus  : {} Flames", total_fees);
                     println!("====================================================================\n");
                     
+                    // 💡 FIX LOCAL : Le mineur met immédiatement les empreintes dans son registre noir
+                    for tx in &candidate_block.transactions {
+                        if !tx.stealth_address.starts_with("COINBASE_") {
+                            chain.spent_key_images.insert(tx.kyber_capsule.clone());
+                        }
+                    }
+
                     chain.chain.push(candidate_block.clone());
                     chain.prune_old_signatures(); 
                     chain.update_target(); 
