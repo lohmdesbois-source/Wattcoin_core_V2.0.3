@@ -146,7 +146,9 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
 
                     P2PMessage::NewBlock { block, sender_port } => {
                         let full_addr = format!("{}:{}", peer_ip, sender_port);
-                        peers_clone.lock().unwrap().insert(full_addr);
+                        
+                        // 💡 FIX : On donne un CLONE de full_addr au HashSet
+                        peers_clone.lock().unwrap().insert(full_addr.clone());
 
                         let (needs_sync, my_genesis, my_height, process_block) = {
                             let chain = blockchain_clone.lock().unwrap(); 
@@ -182,7 +184,8 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                             let block_to_clean = block.clone(); 
 
                             let mut chain = blockchain_clone.lock().unwrap();
-                            if let Err(e) = chain.validate_and_add_external_block(block) {
+                            // 💡 On passe un clone du bloc pour pouvoir le réutiliser
+                            if let Err(e) = chain.validate_and_add_external_block(block.clone()) {
                                 println!("   🚨 BLOC REJETÉ : {}", e);
                             } else {
                                 let mut mp = mempool_clone.lock().unwrap();
@@ -192,6 +195,22 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                                 });
                                 let removed = initial_len - mp.len();
                                 println!("🧹 [MEMPOOL] Nettoyé suite au bloc d'un pair. TX retirées : {}, restantes : {}", removed, mp.len());
+                                
+                                // 📢 NOUVEAU : LE RELAIS PROPAGE LE BLOC À TOUS LES AUTRES MINEURS !
+                                let peers_list = peers_clone.lock().unwrap().clone();
+                                for peer in peers_list {
+                                    // On ne renvoie pas le bloc à celui qui vient de nous le donner !
+                                    if peer != full_addr {
+                                        let target_clone = peer.clone();
+                                        let block_clone = block_to_clean.clone();
+                                        let my_port_clone = my_port_clone.clone(); 
+                                        let p2p_chain_broadcast = Arc::clone(&blockchain_clone); 
+                                        
+                                        tokio::spawn(async move {
+                                            crate::network::broadcast_block(&target_clone, &my_port_clone, block_clone, p2p_chain_broadcast).await;
+                                        });
+                                    }
+                                }
                             }
                         }
                     },
