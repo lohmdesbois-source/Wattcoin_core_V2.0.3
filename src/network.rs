@@ -304,13 +304,12 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
 pub async fn broadcast_block(target_peer: &str, my_port: &str, block: Block, blockchain: Arc<Mutex<Blockchain>>) {
     let address = format_peer_address(target_peer);
     
-    // 💡 On gère l'échec de connexion pour ne plus être aveugle !
     match TcpStream::connect(&address).await {
         Ok(mut stream) => {
             let envelope = P2PMessage::NewBlock { block, sender_port: my_port.to_string() };
             let _ = stream.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
 
-            // On écoute la réponse du serveur (qui pourrait nous recadrer !)
+            // On écoute la réponse du serveur
             if let Some(P2PMessage::Handshake { current_height, .. }) = read_p2p_message(&mut stream).await {
                 
                 let (my_height, my_genesis) = {
@@ -318,35 +317,35 @@ pub async fn broadcast_block(target_peer: &str, my_port: &str, block: Block, blo
                     (chain.chain.len() as u64, chain.chain[0].header.hash.clone())
                 };
 
-                // 💡 FIX : On compare intelligemment les hauteurs !
                 if current_height > my_height {
                     println!("⏩ [P2P] Oups, mon bloc a été refusé car je suis en retard ! (Réseau: {}, Moi: {})", current_height, my_height);
                     
-                    // On supplie le serveur de nous envoyer la vraie chaîne
-                    let envelope_req = P2PMessage::Handshake { 
-                        genesis_hash: my_genesis, 
-                        current_height: my_height, 
-                        sender_port: my_port.to_string() 
-                    };
-                    let _ = stream.write_all(serde_json::to_string(&envelope_req).unwrap().as_bytes()).await;
+                    // 💡 FIX : Le serveur a raccroché. On le RAPPELLE pour aspirer sa chaîne !
+                    let target_clone = target_peer.to_string();
+                    let my_port_clone = my_port.to_string();
+                    let chain_clone = Arc::clone(&blockchain);
+                    
+                    tokio::spawn(async move {
+                        // send_handshake va se connecter, demander la chaîne, la télécharger et faire le resolve_fork !
+                        crate::network::send_handshake(&target_clone, &my_port_clone, my_genesis, my_height, chain_clone).await;
+                    });
 
-                    // On réceptionne et on écrase notre mauvaise chaîne
-                    if let Some(P2PMessage::SyncResponse { blocks }) = read_p2p_message(&mut stream).await {
-                        println!("📦 [P2P] Réception de la chaîne de rattrapage ({} blocs) !", blocks.len());
-                        let mut chain = blockchain.lock().unwrap();
-                        if chain.resolve_fork(blocks) {
-                            println!("✅ [P2P] Synchronisation réussie ! Je suis de nouveau à jour.");
-                        }
-                    }
                 } else if current_height < my_height {
-                    // Le serveur est VRAIMENT en retard
                     println!("📡 [NAT] Le serveur est en retard (Hauteur: {}). Envoi de ma blockchain complète...", current_height);
                     let blocks_to_send = {
                         let chain = blockchain.lock().unwrap();
                         chain.chain.clone()
                     }; 
-                    let envelope_sync = P2PMessage::SyncResponse { blocks: blocks_to_send };
-                    let _ = stream.write_all(serde_json::to_string(&envelope_sync).unwrap().as_bytes()).await;
+                    
+                    // 💡 Pareil ici, on ouvre une nouvelle connexion pour lui pousser les blocs
+                    let target_clone = target_peer.to_string();
+                    tokio::spawn(async move {
+                        let addr = format_peer_address(&target_clone);
+                        if let Ok(mut new_stream) = TcpStream::connect(&addr).await {
+                            let envelope_sync = P2PMessage::SyncResponse { blocks: blocks_to_send };
+                            let _ = new_stream.write_all(serde_json::to_string(&envelope_sync).unwrap().as_bytes()).await;
+                        }
+                    });
                 }
             }
         },
