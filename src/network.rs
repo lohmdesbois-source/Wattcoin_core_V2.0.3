@@ -183,11 +183,35 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                             println!("\n🌍 [P2P] Nouveau BLOC {} reçu en direct !", block.header.index);
                             let block_to_clean = block.clone(); 
 
-                            let mut chain = blockchain_clone.lock().unwrap();
-                            // 💡 On passe un clone du bloc pour pouvoir le réutiliser
-                            if let Err(e) = chain.validate_and_add_external_block(block.clone()) {
-                                println!("   🚨 BLOC REJETÉ : {}", e);
+                            // 💡 NOUVEAU FIX : On enferme le Mutex dans un bloc !
+                            // Il mourra automatiquement à l'accolade fermante.
+                            let reject_info = {
+                                let mut chain = blockchain_clone.lock().unwrap();
+                                
+                                if let Err(e) = chain.validate_and_add_external_block(block.clone()) {
+                                    println!("   🚨 BLOC REJETÉ : {}", e);
+                                    let my_genesis = chain.chain[0].header.hash.clone();
+                                    let my_height = chain.chain.len() as u64;
+                                    // On retourne les infos pour envoyer l'erreur
+                                    Some((my_genesis, my_height))
+                                } else {
+                                    // Pas d'erreur, le bloc est validé !
+                                    None
+                                }
+                            }; // 🔓 Le MutexGuard `chain` est GARANTI détruit ici !
+
+                            // 🌐 Maintenant, on est libre de faire du réseau asynchrone (.await)
+                            if let Some((my_genesis, my_height)) = reject_info {
+                                // Le bloc a été rejeté, on prévient le mineur
+                                let envelope = P2PMessage::Handshake { 
+                                    genesis_hash: my_genesis, 
+                                    current_height: my_height, 
+                                    sender_port: my_port_clone.clone() 
+                                };
+                                let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
+                                
                             } else {
+                                // Le bloc a été validé ! On nettoie et on propage.
                                 let mut mp = mempool_clone.lock().unwrap();
                                 let initial_len = mp.len();
                                 mp.retain(|tx| {
@@ -196,10 +220,9 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                                 let removed = initial_len - mp.len();
                                 println!("🧹 [MEMPOOL] Nettoyé suite au bloc d'un pair. TX retirées : {}, restantes : {}", removed, mp.len());
                                 
-                                // 📢 NOUVEAU : LE RELAIS PROPAGE LE BLOC À TOUS LES AUTRES MINEURS !
+                                // 📢 LE RELAIS PROPAGE LE BLOC À TOUS LES AUTRES MINEURS !
                                 let peers_list = peers_clone.lock().unwrap().clone();
                                 for peer in peers_list {
-                                    // On ne renvoie pas le bloc à celui qui vient de nous le donner !
                                     if peer != full_addr {
                                         let target_clone = peer.clone();
                                         let block_clone = block_to_clean.clone();
