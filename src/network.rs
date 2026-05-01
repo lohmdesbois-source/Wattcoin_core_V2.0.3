@@ -235,6 +235,22 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
                                     }
                                 }
                             }
+                        } else {
+                            // 💡 NOUVEAU FIX : Le bloc est dans le passé ! Le mineur est sur une vieille branche (fork).
+                            // On lui envoie un Handshake en pleine tête pour le forcer à se mettre à jour !
+                            println!("🕰️ [P2P] Bloc obsolète reçu ({}). Le nœud {} est sur un fork, on le réveille !", block.header.index, sender_port);
+                            
+                            let (my_genesis, my_height) = {
+                                let chain_lock = blockchain_clone.lock().unwrap();
+                                (chain_lock.chain[0].header.hash.clone(), chain_lock.chain.len() as u64)
+                            };
+
+                            let envelope = P2PMessage::Handshake { 
+                                genesis_hash: my_genesis, 
+                                current_height: my_height, 
+                                sender_port: my_port_clone.clone() 
+                            };
+                            let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
                         }
                     },
 
@@ -287,18 +303,25 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
 
 pub async fn broadcast_block(target_peer: &str, my_port: &str, block: Block, blockchain: Arc<Mutex<Blockchain>>) {
     let address = format_peer_address(target_peer);
-    if let Ok(mut stream) = TcpStream::connect(&address).await {
-        let envelope = P2PMessage::NewBlock { block, sender_port: my_port.to_string() };
-        let _ = stream.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
+    
+    // 💡 NOUVEAU : On gère l'échec de connexion pour ne plus être aveugle !
+    match TcpStream::connect(&address).await {
+        Ok(mut stream) => {
+            let envelope = P2PMessage::NewBlock { block, sender_port: my_port.to_string() };
+            let _ = stream.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
 
-        if let Some(P2PMessage::Handshake { current_height, .. }) = read_p2p_message(&mut stream).await {
-            println!("📡 [NAT] Le serveur est en retard (Hauteur: {}). Envoi de la blockchain complète...", current_height);
-            let blocks_to_send = {
-                let chain = blockchain.lock().unwrap();
-                chain.chain.clone()
-            }; 
-            let envelope_sync = P2PMessage::SyncResponse { blocks: blocks_to_send };
-            let _ = stream.write_all(serde_json::to_string(&envelope_sync).unwrap().as_bytes()).await;
+            if let Some(P2PMessage::Handshake { current_height, .. }) = read_p2p_message(&mut stream).await {
+                println!("📡 [NAT] Le serveur est en retard (Hauteur: {}). Envoi de la blockchain complète...", current_height);
+                let blocks_to_send = {
+                    let chain = blockchain.lock().unwrap();
+                    chain.chain.clone()
+                }; 
+                let envelope_sync = P2PMessage::SyncResponse { blocks: blocks_to_send };
+                let _ = stream.write_all(serde_json::to_string(&envelope_sync).unwrap().as_bytes()).await;
+            }
+        },
+        Err(e) => {
+            println!("⚠️ [P2P] Impossible de joindre {} pour propager le bloc (Pare-feu ou Nœud hors ligne) : {}", address, e);
         }
     }
 }
