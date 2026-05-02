@@ -228,6 +228,71 @@ impl Blockchain {
 
         true
     }
+	
+	// 🪚 NOUVEAU : LA GREFFE CYBERNÉTIQUE (Ancêtre Commun)
+    pub fn resolve_partial_fork(&mut self, new_blocks: Vec<Block>) -> bool {
+        if new_blocks.is_empty() { return false; }
+
+        let start_index = new_blocks[0].header.index as usize;
+
+        // Si on nous renvoie depuis le Genesis, on utilise l'ancienne méthode
+        if start_index == 0 {
+            return self.resolve_fork(new_blocks);
+        }
+
+        if start_index > self.chain.len() {
+            println!("❌ Impossible de greffer : Il manque des blocs intermédiaires !");
+            return false;
+        }
+
+        // On vérifie que le bloc précédent correspond bien à notre ancêtre
+        let ancestor_index = start_index - 1;
+        if self.chain[ancestor_index].header.hash != new_blocks[0].header.previous_hash {
+            println!("❌ Point de greffe invalide (Le hash précédent ne correspond pas au point de jonction).");
+            return false;
+        }
+
+        // 💥 Vérification du Hash avec RandomX (Mode Léger) sur le morceau reçu
+        let flags = RandomXFlag::get_recommended_flags();
+        let genesis_hash = &self.chain[0].header.hash;
+        let cache = RandomXCache::new(flags, genesis_hash.as_bytes()).unwrap();
+        let vm = RandomXVM::new(flags, Some(cache), None).unwrap(); 
+
+        for block in &new_blocks {
+            let header_data = format!("{}{}{}{}", block.header.index, block.header.timestamp, block.header.previous_hash, block.header.nonce);
+            let hash_bytes = vm.calculate_hash(header_data.as_bytes()).unwrap();
+            if hex::encode(&hash_bytes) != block.header.hash { return false; }
+        }
+
+        // ⚖️ On crée une chaîne théorique pour la peser face à la nôtre
+        let mut theoretical_chain = self.chain[0..=ancestor_index].to_vec();
+        theoretical_chain.extend(new_blocks.clone());
+
+        let my_work = Blockchain::calculate_total_work(&self.chain);
+        let new_work = Blockchain::calculate_total_work(&theoretical_chain);
+
+        // Si la greffe rend la chaîne plus lourde, on valide et on coupe la branche morte !
+        if new_work > my_work || (new_work == my_work && new_blocks.last().unwrap().header.timestamp < self.chain.last().unwrap().header.timestamp) {
+            println!("🪓 Taille de la mauvaise branche ({} blocs jetés) et greffe de la nouvelle !", self.chain.len() - start_index);
+            self.chain = theoretical_chain;
+            self.recalculate_target_from_scratch(); 
+
+            // 💡 Reconstruction du registre noir des doubles dépenses
+            let mut new_spent = HashSet::new();
+            for block in &self.chain {
+                for tx in &block.transactions {
+                    if !tx.stealth_address.starts_with("COINBASE_") && tx.stealth_address != "GENESIS" {
+                        new_spent.insert(tx.kyber_capsule.clone());
+                    }
+                }
+            }
+            self.spent_key_images = new_spent;
+
+            return true;
+        }
+        
+        false
+    }
     
     // 🛡️ LE TRIBUNAL DU RÉSEAU
     pub fn validate_and_add_external_block(&mut self, block: Block) -> Result<(), String> {

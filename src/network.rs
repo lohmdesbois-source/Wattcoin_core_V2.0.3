@@ -11,8 +11,12 @@ use crate::api::{Order, SharedPool};
 #[derive(Serialize, Deserialize, Debug)]
 pub enum P2PMessage {
     Handshake { genesis_hash: String, current_height: u64, sender_port: String },
+    
+    // 💡 NOUVEAU : On demande juste le Delta !
+    SyncRequest { current_height: u64, last_hash: String, sender_port: String }, 
+    
     SyncResponse { blocks: Vec<Block> },
-    NewBlock { block: Block, sender_port: String }, 
+    NewBlock { block: Block, sender_port: String },
     WhisperTransaction { tx: Transaction },    
     BroadcastTransaction { tx: Transaction },  
     BroadcastOrder { order: Order },
@@ -59,88 +63,104 @@ pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<B
             if let Some(message) = read_p2p_message(&mut socket).await {
                 match message {
                     P2PMessage::Handshake { genesis_hash, current_height, sender_port } => {
-                        // 📖 On enregistre ce nouveau contact dans notre carnet !
                         let full_addr = format!("{}:{}", peer_ip, sender_port);
                         peers_clone.lock().unwrap().insert(full_addr);
 
-                        let (is_behind, blocks_to_send) = {
+                        let (is_behind, i_am_ahead, my_height, my_hash) = {
                             let chain = blockchain_clone.lock().unwrap(); 
+                            let my_h = chain.chain.len() as u64;
                             let my_genesis = &chain.chain[0].header.hash;
+                            let my_last_hash = chain.chain.last().unwrap().header.hash.clone();
                             
                             if genesis_hash != *my_genesis {
                                 println!("🚨 [P2P] INTRUSION REJETÉE.");
-                                (false, None)
+                                (false, false, 0, String::new())
                             } else {
-                                let my_height = chain.chain.len() as u64;
-                                if current_height < my_height {
-                                    println!("🔄 [P2P] Le nœud {} est en RETARD. Envoi direct de l'historique...", sender_port);
-                                    (true, Some(chain.chain.clone()))
-                                } else {
-                                    println!("🤝 [P2P] Poignée de main ok avec {}.", sender_port);
-                                    (false, None)
-                                }
+                                (current_height > my_h, my_h > current_height, my_h, my_last_hash)
                             }
                         }; 
 
                         if is_behind {
-                            if let Some(all_blocks) = blocks_to_send {
-                                let envelope = P2PMessage::SyncResponse { blocks: all_blocks };
-                                let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await; 
+                            // 💡 NOUVEAU : On ne subit plus, on DEMANDE le delta intelligent !
+                            println!("🔄 [P2P] Je suis en retard. Demande du delta à {}...", sender_port);
+                            let envelope = P2PMessage::SyncRequest { 
+                                current_height: my_height, 
+                                last_hash: my_hash, 
+                                sender_port: my_port_clone.clone() 
+                            };
+                            let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
+                        } else if i_am_ahead {
+                            // On lui fait coucou pour qu'il réalise qu'il est en retard
+                            let envelope = P2PMessage::Handshake { 
+                                genesis_hash, 
+                                current_height: my_height, 
+                                sender_port: my_port_clone.clone() 
+                            };
+                            let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
+                        }
+                    },
+
+                    // 💡 NOUVEAU : LE SERVEUR CALCULE LE DELTA ET L'ANCÊTRE COMMUN !
+                    P2PMessage::SyncRequest { current_height, last_hash, sender_port } => {
+                        
+                        // 1. On enferme le Mutex dans ce bloc strict !
+                        let blocks_to_send = {
+                            let chain = blockchain_clone.lock().unwrap(); 
+                            let my_height = chain.chain.len() as u64;
+
+                            if my_height > current_height {
+                                println!("📤 [P2P] Le nœud {} demande une mise à jour. Calcul du Delta...", sender_port);
+                                
+                                let mut start_idx = current_height as usize;
+                                let check_idx = start_idx.saturating_sub(1); 
+
+                                // A-t-il le même historique que nous ?
+                                if check_idx < chain.chain.len() && chain.chain[check_idx].header.hash == last_hash {
+                                    println!("✅ Aucun fork détecté, envoi du delta propre à partir du bloc {}.", start_idx);
+                                } else {
+                                    // FORK ! On recule de 10 blocs pour trouver la racine commune
+                                    println!("🔀 Fork détecté avec {} ! On recule pour la greffe.", sender_port);
+                                    start_idx = start_idx.saturating_sub(10);
+                                    if start_idx == 0 { start_idx = 1; } 
+                                }
+
+                                // On retourne les blocs pour pouvoir les envoyer plus bas
+                                Some(chain.chain[start_idx..].to_vec())
+                            } else {
+                                None
                             }
+                        }; // 🔓 LE MUTEX EST TOTALEMENT DÉTRUIT ICI. 100% GARANTI.
+
+                        // 2. Maintenant on est libre de faire de l'asynchrone (.await) en toute sécurité !
+                        if let Some(blocks) = blocks_to_send {
+                            let envelope = P2PMessage::SyncResponse { blocks };
+                            let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
                         }
                     },
                     
-                    // 📥 RÉCEPTION DE SYNCHRONISATION
+                    // 📥 RÉCEPTION DE LA GREFFE DE SYNCHRONISATION
                     P2PMessage::SyncResponse { blocks } => {
+                        if blocks.is_empty() { return; }
+                        
                         let mut chain = blockchain_clone.lock().unwrap(); 
-                        println!("📦 [P2P] Réception d'une synchronisation massive ({} blocs) !", blocks.len());
+                        println!("📦 [P2P] Réception d'un Delta ({} blocs reçus) !", blocks.len());
                         
-                        let my_work = Blockchain::calculate_total_work(&chain.chain);
-                        let new_work = Blockchain::calculate_total_work(&blocks);
-                        
-                        // Variable pour savoir si on a accepté la nouvelle chaîne
-                        let mut chain_accepted = false; 
-                        
-                        if new_work > my_work {
-                            println!("⚖️ Le Juge a pesé : La nouvelle chaîne est plus LOURDE (Poids supérieur) !");
-                            if chain.resolve_fork(blocks.clone()) { // On clone pour pouvoir nettoyer le mempool après
-                                println!("✅ Synchronisation réussie ! Nous sommes à jour.");
-                                chain_accepted = true;
-                            } else {
-                                println!("❌ Chaîne massive rejetée par le Juge (Invalide).");
-                            }
-                        } else if new_work == my_work && blocks.len() > 0 && chain.chain.len() > 0 {
-                            let my_last_time = chain.chain.last().unwrap().header.timestamp;
-                            let new_last_time = blocks.last().unwrap().header.timestamp;
+                        // 💡 FIX : On utilise ta nouvelle fonction de greffe !
+                        if chain.resolve_partial_fork(blocks.clone()) { 
+                            println!("✅ Synchronisation partielle réussie ! Nous sommes à jour.");
                             
-                            if new_last_time < my_last_time {
-                                println!("⏱️ Égalité de poids, mais la chaîne concurrente a été minée AVANT la nôtre ! On l'adopte.");
-                                if chain.resolve_fork(blocks.clone()) {
-                                    println!("✅ Synchronisation réussie ! Nous sommes à jour.");
-                                    chain_accepted = true;
-                                } else {
-                                    println!("❌ Chaîne concurrente rejetée par le Juge (Invalide).");
-                                }
-                            } else {
-                                println!("🛡️ Égalité parfaite, mais notre chaîne a été minée avant (ou en même temps). On garde la nôtre !");
-                            }
-                        } else {
-                            println!("🛡️ Chaîne massive ignorée : Notre chaîne est plus lourde !");
-                        }
-                        
-                        // 🧹 LE GRAND NETTOYAGE : Si on a adopté une nouvelle chaîne, on vide les transactions
-                        // de notre Mempool qui sont DÉJÀ dans cette nouvelle chaîne !
-                        if chain_accepted {
+                            // Nettoyage du mempool post-greffe
                             let mut mp = mempool_clone.lock().unwrap();
                             let initial_len = mp.len();
                             mp.retain(|tx| {
-                                // On garde la transaction SEULEMENT SI elle n'est dans aucun des nouveaux blocs
                                 !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == tx.kyber_capsule))
                             });
                             let removed = initial_len - mp.len();
                             if removed > 0 {
-                                println!("🧹 [MEMPOOL] Nettoyage massif après synchro. {} TX retirée(s).", removed);
+                                println!("🧹 [MEMPOOL] Nettoyage après greffe. {} TX retirée(s).", removed);
                             }
+                        } else {
+                            println!("❌ Greffe rejetée par le Juge.");
                         }
                     },
 
