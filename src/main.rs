@@ -7,14 +7,14 @@ pub mod lattice;
 
 use std::env;
 use std::sync::{Arc, Mutex};
-use std::collections::HashSet; // 💡 NOUVEAU : Pour le carnet d'adresses
+use std::collections::{HashSet, HashMap}; 
 use randomx_rs::{RandomXFlag, RandomXCache, RandomXDataset, RandomXVM};
 use blockchain::Blockchain;
 use transaction::Transaction;
 use api::SharedPool; 
 
 pub type SharedMempool = Arc<Mutex<Vec<Transaction>>>;
-pub type SharedPeers = Arc<Mutex<HashSet<String>>>; // 📖 NOUVEAU : Le carnet de contacts du Nœud !
+pub type SharedPeers = Arc<Mutex<HashSet<String>>>; 
 
 #[tokio::main]
 async fn main() {
@@ -46,7 +46,7 @@ async fn main() {
     };
 
     if is_relay_mode {
-        println!("🛡️  MODE RELAIS ACTIVÉ : Minage désactivé. Le Nœud agira comme un simple routeur silencieux.");
+        println!("🛡️  MODE RELAIS ACTIVÉ : Minage désactivé. Le Nœud agira comme un routeur P2P.");
     }
     
     let db_file = format!("chain_{}.json", port);
@@ -55,43 +55,49 @@ async fn main() {
     let dex_pool: SharedPool = Arc::new(Mutex::new(Vec::new()));
 
     let genesis_hash = shared_chain.lock().unwrap().chain[0].header.hash.clone();
-    let current_height = shared_chain.lock().unwrap().chain.len() as u64;
-
-    // 📖 INITIALISATION DU CARNET D'ADRESSES
+    
     let known_peers: SharedPeers = Arc::new(Mutex::new(HashSet::new()));
     if let Some(target) = &peer_target {
-        known_peers.lock().unwrap().insert(target.clone()); // On note le voisin défini dans la commande
+        known_peers.lock().unwrap().insert(target.clone()); 
     }
 
-    // 🌐 1. DÉMARRAGE DU RÉSEAU P2P
+    // 💡 LE REGISTRE DES TUNNELS P2P ACTIFS
+    let active_peers: network::ActivePeers = Arc::new(Mutex::new(HashMap::new()));
+
+    // 🌐 1. DÉMARRAGE DU SERVEUR P2P
     let p2p_chain = Arc::clone(&shared_chain);
     let p2p_mempool = Arc::clone(&mempool);
     let p2p_dex_pool = Arc::clone(&dex_pool);
-    let p2p_peers = Arc::clone(&known_peers); // On donne le carnet au serveur P2P
+    let p2p_peers = Arc::clone(&known_peers); 
+    let p2p_active = Arc::clone(&active_peers);
     let port_clone = port.clone();
     let bind_ip_p2p = p2p_bind_ip.to_string(); 
-    tokio::spawn(async move { network::start_p2p_server(&bind_ip_p2p, &port_clone, p2p_chain, p2p_mempool, p2p_dex_pool, p2p_peers).await; });
+    tokio::spawn(async move { network::start_p2p_server(&bind_ip_p2p, &port_clone, p2p_chain, p2p_mempool, p2p_dex_pool, p2p_peers, p2p_active).await; });
     
     // 🔌 2. DÉMARRAGE DE L'API REST
     let api_chain = Arc::clone(&shared_chain);
     let api_mempool = Arc::clone(&mempool);
-    let api_peers = Arc::clone(&known_peers); // On donne le carnet à l'API pour qu'elle puisse crier !
-    tokio::spawn(async move { api::start_api_server(api_port, api_bind_ip, api_mempool, api_chain, api_peers, dex_pool).await; });
+    let api_peers = Arc::clone(&known_peers); 
+    let api_dex_pool = Arc::clone(&dex_pool); // 💡 FIX : On clone le pool DEX avant de l'envoyer dans le thread !
+    tokio::spawn(async move { api::start_api_server(api_port, api_bind_ip, api_mempool, api_chain, api_peers, api_dex_pool).await; });
 
-    // 🤝 3. POIGNÉE DE MAIN P2P
+    // 🤝 3. OUVERTURE DU TUNNEL VERS LE BOOTSTRAP
     if let Some(target) = &peer_target {
-        println!("🤝 Appel du nœud voisin sur {}...", target);
+        println!("🤝 Ouverture du tunnel P2P vers {}...", target);
         let target_clone = target.clone();
-        let genesis_clone = genesis_hash.clone();
         let my_port = port.clone();
         let p2p_chain_handshake = Arc::clone(&shared_chain);
+        let p2p_mempool_hs = Arc::clone(&mempool);
+        let p2p_dex_hs = Arc::clone(&dex_pool);
+        let p2p_peers_hs = Arc::clone(&known_peers);
+        let p2p_active_hs = Arc::clone(&active_peers);
+        
         tokio::spawn(async move {
-            network::send_handshake(&target_clone, &my_port, genesis_clone, current_height, p2p_chain_handshake).await;
+            network::connect_to_network(&target_clone, &my_port, p2p_chain_handshake, p2p_mempool_hs, p2p_dex_hs, p2p_peers_hs, p2p_active_hs).await;
         });
     }
 
     if is_relay_mode {
-        println!("📡 Le Nœud Relais est en ligne et écoute le réseau...");
         let db_file_relay = format!("chain_{}.json", port);
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -112,9 +118,9 @@ async fn main() {
 
         println!("\n⛏️  Début de l'extraction pour l'adresse : {}...", miner_address);
         loop {
-            // 💡 FIX : On passe aussi `shared_chain` pour que l'aspirateur puisse lire le registre noir
-            if let Some(target) = &peer_target {
-                network::pull_mempool(target, Arc::clone(&mempool), Arc::clone(&shared_chain)).await;
+            // 💡 On demande un rafraichissement du Mempool via nos tunnels ouverts
+            if peer_target.is_some() {
+                network::request_mempool(Arc::clone(&active_peers)).await;
             }
 
             // --- ÉTAPE A : PRÉPARER LE BLOC ---
@@ -167,9 +173,7 @@ async fn main() {
                     let nb_tx = candidate_block.transactions.len();
                     let mut total_fees = 0;
                     
-                    for tx in candidate_block.transactions.iter().skip(1) {
-                        total_fees += tx.fee; 
-                    }
+                    for tx in candidate_block.transactions.iter().skip(1) { total_fees += tx.fee; }
 
                     println!("\n====================================================================");
                     println!("🎉 EURÊKA ! NOUVEAU BLOC FORGÉ PAR LE MINEUR !");
@@ -181,7 +185,6 @@ async fn main() {
                     println!("💰 Frais perçus  : {} Flames", total_fees);
                     println!("====================================================================\n");
                     
-                    // 💡 FIX LOCAL : Le mineur met immédiatement les empreintes dans son registre noir
                     for tx in &candidate_block.transactions {
                         if !tx.stealth_address.starts_with("COINBASE_") {
                             chain.spent_key_images.insert(tx.kyber_capsule.clone());
@@ -193,18 +196,14 @@ async fn main() {
                     chain.update_target(); 
                     chain.save_to_disk(&db_file);
 
-                    // 💡 NOUVEAU : On propage le bloc à TOUT LE CARNET D'ADRESSES !
-                    let peers_list = known_peers.lock().unwrap().clone();
-                    for peer in peers_list {
-                        let target_clone = peer.clone();
-                        let block_clone = candidate_block.clone();
-                        let my_port_clone = port.clone(); 
-                        let p2p_chain_broadcast = Arc::clone(&shared_chain); 
-                        
-                        tokio::spawn(async move {
-                            network::broadcast_block(&target_clone, &my_port_clone, block_clone, p2p_chain_broadcast).await;
-                        });
-                    }
+                    // 💡 NOUVEAU : On glisse le bloc dans nos tunnels P2P déjà ouverts !
+                    let block_clone = candidate_block.clone();
+                    let my_port_clone = port.clone(); 
+                    let active_clone = Arc::clone(&active_peers);
+                    
+                    tokio::spawn(async move {
+                        network::broadcast_mined_block(&my_port_clone, block_clone, active_clone).await;
+                    });
                 }
                 
                 let mut mp = mempool.lock().unwrap();

@@ -1,446 +1,332 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
-use rand::Rng; 
+use rand::Rng;
 use crate::block::Block;
 use crate::blockchain::Blockchain;
 use crate::transaction::Transaction;
 use crate::api::{Order, SharedPool};
 
+// 💡 LE CŒUR DU NOUVEAU RÉSEAU : Le registre des tunnels ouverts
+pub type ActivePeers = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum P2PMessage {
     Handshake { genesis_hash: String, current_height: u64, sender_port: String },
-    
-    // 💡 NOUVEAU : On demande juste le Delta !
     SyncRequest { current_height: u64, last_hash: String, sender_port: String }, 
-    
     SyncResponse { blocks: Vec<Block> },
-    NewBlock { block: Block, sender_port: String },
+    NewBlock { block: Block, sender_port: String }, 
     WhisperTransaction { tx: Transaction },    
     BroadcastTransaction { tx: Transaction },  
     BroadcastOrder { order: Order },
-    
-    // 💡 NOUVEAU : Les messages pour aspirer le Mempool à travers les pare-feux !
     GetMempool,
     MempoolSync { txs: Vec<Transaction> },
 }
 
-async fn read_p2p_message(stream: &mut TcpStream) -> Option<P2PMessage> {
-    let mut json_str = String::new();
-    let mut temp_buf = vec![0; 65536]; 
-    
-    while let Ok(n) = stream.read(&mut temp_buf).await {
-        if n == 0 { break; } 
-        json_str.push_str(&String::from_utf8_lossy(&temp_buf[..n]));
-        if let Ok(message) = serde_json::from_str::<P2PMessage>(&json_str) {
-            return Some(message);
+// 💡 Lecture en continu (NDJSON). On lit ligne par ligne jusqu'au \n.
+async fn read_p2p_message(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Option<P2PMessage> {
+    let mut line = String::new();
+    match reader.read_line(&mut line).await {
+        Ok(0) => None, // La connexion a été coupée
+        Ok(_) => {
+            serde_json::from_str::<P2PMessage>(&line.trim()).ok()
         }
+        Err(_) => None,
     }
-    None 
 }
 
-// 💡 FIX : On ajoute known_peers dans les paramètres
-pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool, known_peers: crate::SharedPeers) {
+// 💡 Fonction utilitaire pour envoyer un message avec un \n final
+async fn send_message_to_channel(sender: &mpsc::Sender<String>, message: P2PMessage) {
+    let mut json_str = serde_json::to_string(&message).unwrap();
+    json_str.push('\n'); // Crucial pour le BufReader !
+    let _ = sender.send(json_str).await;
+}
+
+pub async fn start_p2p_server(host_ip: &str, port: &str, blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool, known_peers: crate::SharedPeers, active_peers: ActivePeers) {
     let address = format!("{}:{}", host_ip, port);
     let listener = TcpListener::bind(&address).await.unwrap();
-    println!("📡 Serveur P2P à l'écoute sur TCP/{} (IP: {})...", port, host_ip);
+    println!("📡 Serveur P2P (Tunnels Persistants) à l'écoute sur TCP/{}...", port);
     
     let my_port = port.to_string(); 
 
     loop {
-        // 💡 NOUVEAU : On récupère l'IP réelle de la personne qui se connecte
-        let (mut socket, peer_addr) = listener.accept().await.unwrap();
+        let (socket, peer_addr) = listener.accept().await.unwrap();
         let peer_ip = peer_addr.ip().to_string();
         
-        let blockchain_clone = Arc::clone(&blockchain);
-        let mempool_clone = Arc::clone(&mempool); 
-        let dex_pool_clone = Arc::clone(&dex_pool);
-        let peers_clone = Arc::clone(&known_peers);
-        let my_port_clone = my_port.clone();
+        start_peer_connection(
+            socket, peer_ip, my_port.clone(), 
+            Arc::clone(&blockchain), Arc::clone(&mempool), Arc::clone(&dex_pool), 
+            Arc::clone(&known_peers), Arc::clone(&active_peers)
+        );
+    }
+}
 
-        tokio::spawn(async move {
-            if let Some(message) = read_p2p_message(&mut socket).await {
-                match message {
-                    P2PMessage::Handshake { genesis_hash, current_height, sender_port } => {
-                        let full_addr = format!("{}:{}", peer_ip, sender_port);
-                        peers_clone.lock().unwrap().insert(full_addr);
+// 🧠 LE GESTIONNAIRE DE TUNNEL
+fn start_peer_connection(
+    socket: TcpStream, peer_ip: String, my_port: String,
+    blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool,
+    known_peers: crate::SharedPeers, active_peers: ActivePeers
+) {
+    let (read_half, mut write_half) = socket.into_split();
+    let mut reader = BufReader::new(read_half);
+    let (tx, mut rx) = mpsc::channel::<String>(100);
 
-                        let (is_behind, i_am_ahead, my_height, my_hash) = {
-                            let chain = blockchain_clone.lock().unwrap(); 
-                            let my_h = chain.chain.len() as u64;
-                            let my_genesis = &chain.chain[0].header.hash;
-                            let my_last_hash = chain.chain.last().unwrap().header.hash.clone();
-                            
-                            if genesis_hash != *my_genesis {
-                                println!("🚨 [P2P] INTRUSION REJETÉE.");
-                                (false, false, 0, String::new())
-                            } else {
-                                (current_height > my_h, my_h > current_height, my_h, my_last_hash)
-                            }
-                        }; 
+    let temp_peer_id = format!("{}:incoming", peer_ip);
+    active_peers.lock().unwrap().insert(temp_peer_id.clone(), tx.clone());
 
-                        if is_behind {
-                            // 💡 NOUVEAU : On ne subit plus, on DEMANDE le delta intelligent !
-                            println!("🔄 [P2P] Je suis en retard. Demande du delta à {}...", sender_port);
-                            let envelope = P2PMessage::SyncRequest { 
-                                current_height: my_height, 
-                                last_hash: my_hash, 
-                                sender_port: my_port_clone.clone() 
-                            };
-                            let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
-                        } else if i_am_ahead {
-                            // On lui fait coucou pour qu'il réalise qu'il est en retard
-                            let envelope = P2PMessage::Handshake { 
-                                genesis_hash, 
-                                current_height: my_height, 
-                                sender_port: my_port_clone.clone() 
-                            };
-                            let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
+    // 📤 TÂCHE D'ÉCRITURE
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if write_half.write_all(msg.as_bytes()).await.is_err() { break; }
+        }
+    });
+
+    // 📥 TÂCHE DE LECTURE
+    tokio::spawn(async move {
+        let mut actual_peer_id = temp_peer_id.clone();
+
+        while let Some(message) = read_p2p_message(&mut reader).await {
+            match message {
+                P2PMessage::Handshake { genesis_hash, current_height, sender_port } => {
+                    actual_peer_id = format!("{}:{}", peer_ip, sender_port);
+                    known_peers.lock().unwrap().insert(actual_peer_id.clone());
+                    
+                    // 💡 FIX : Le bloc {} garantit la mort du MutexGuard
+                    {
+                        let mut ap = active_peers.lock().unwrap();
+                        if let Some(sender) = ap.remove(&temp_peer_id) {
+                            ap.insert(actual_peer_id.clone(), sender);
                         }
-                    },
+                    } // 🔓 Le cadenas est détruit à 100% ici
 
-                    // 💡 NOUVEAU : LE SERVEUR CALCULE LE DELTA ET L'ANCÊTRE COMMUN !
-                    P2PMessage::SyncRequest { current_height, last_hash, sender_port } => {
-                        
-                        // 1. On enferme le Mutex dans ce bloc strict !
-                        let blocks_to_send = {
-                            let chain = blockchain_clone.lock().unwrap(); 
-                            let my_height = chain.chain.len() as u64;
+                    let (is_behind, i_am_ahead, my_height, my_hash, genesis_valid) = {
+                        let chain = blockchain.lock().unwrap(); 
+                        let my_h = chain.chain.len() as u64;
+                        (
+                            current_height > my_h, 
+                            my_h > current_height, 
+                            my_h, 
+                            chain.chain.last().unwrap().header.hash.clone(),
+                            genesis_hash == chain.chain[0].header.hash
+                        )
+                    }; 
 
-                            if my_height > current_height {
-                                println!("📤 [P2P] Le nœud {} demande une mise à jour. Calcul du Delta...", sender_port);
-                                
-                                let mut start_idx = current_height as usize;
-                                let check_idx = start_idx.saturating_sub(1); 
+                    if !genesis_valid {
+                        println!("🚨 [P2P] INTRUSION REJETÉE.");
+                        break; 
+                    }
 
-                                // A-t-il le même historique que nous ?
-                                if check_idx < chain.chain.len() && chain.chain[check_idx].header.hash == last_hash {
-                                    println!("✅ Aucun fork détecté, envoi du delta propre à partir du bloc {}.", start_idx);
-                                } else {
-                                    // FORK ! On recule de 10 blocs pour trouver la racine commune
-                                    println!("🔀 Fork détecté avec {} ! On recule pour la greffe.", sender_port);
-                                    start_idx = start_idx.saturating_sub(10);
-                                    if start_idx == 0 { start_idx = 1; } 
-                                }
+                    if is_behind {
+                        println!("🔄 [P2P] Je suis en retard. Demande du delta à {}...", sender_port);
+                        send_message_to_channel(&tx, P2PMessage::SyncRequest { current_height: my_height, last_hash: my_hash, sender_port: my_port.clone() }).await;
+                    } else if i_am_ahead {
+                        send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash, current_height: my_height, sender_port: my_port.clone() }).await;
+                    }
+                },
 
-                                // On retourne les blocs pour pouvoir les envoyer plus bas
+                P2PMessage::SyncRequest { current_height, last_hash, sender_port } => {
+                    let blocks_to_send = {
+                        let chain = blockchain.lock().unwrap(); 
+                        let my_height = chain.chain.len() as u64;
+
+                        if my_height > current_height {
+                            println!("📤 [P2P] Calcul du Delta pour {}...", sender_port);
+                            let mut start_idx = current_height as usize;
+                            let check_idx = start_idx.saturating_sub(1); 
+
+                            if check_idx < chain.chain.len() && chain.chain[check_idx].header.hash == last_hash {
                                 Some(chain.chain[start_idx..].to_vec())
                             } else {
-                                None
+                                println!("🔀 Fork détecté avec {} ! On recule pour la greffe.", sender_port);
+                                start_idx = start_idx.saturating_sub(10);
+                                if start_idx == 0 { start_idx = 1; } 
+                                Some(chain.chain[start_idx..].to_vec())
                             }
-                        }; // 🔓 LE MUTEX EST TOTALEMENT DÉTRUIT ICI. 100% GARANTI.
-
-                        // 2. Maintenant on est libre de faire de l'asynchrone (.await) en toute sécurité !
-                        if let Some(blocks) = blocks_to_send {
-                            let envelope = P2PMessage::SyncResponse { blocks };
-                            let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
-                        }
-                    },
-                    
-                    // 📥 RÉCEPTION DE LA GREFFE DE SYNCHRONISATION
-                    P2PMessage::SyncResponse { blocks } => {
-                        if blocks.is_empty() { return; }
-                        
-                        let mut chain = blockchain_clone.lock().unwrap(); 
-                        println!("📦 [P2P] Réception d'un Delta ({} blocs reçus) !", blocks.len());
-                        
-                        // 💡 FIX : On utilise ta nouvelle fonction de greffe !
-                        if chain.resolve_partial_fork(blocks.clone()) { 
-                            println!("✅ Synchronisation partielle réussie ! Nous sommes à jour.");
-                            
-                            // Nettoyage du mempool post-greffe
-                            let mut mp = mempool_clone.lock().unwrap();
-                            let initial_len = mp.len();
-                            mp.retain(|tx| {
-                                !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == tx.kyber_capsule))
-                            });
-                            let removed = initial_len - mp.len();
-                            if removed > 0 {
-                                println!("🧹 [MEMPOOL] Nettoyage après greffe. {} TX retirée(s).", removed);
-                            }
-                        } else {
-                            println!("❌ Greffe rejetée par le Juge.");
-                        }
-                    },
-
-                    P2PMessage::NewBlock { block, sender_port } => {
-                        let full_addr = format!("{}:{}", peer_ip, sender_port);
-                        
-                        // 💡 FIX : On donne un CLONE de full_addr au HashSet
-                        peers_clone.lock().unwrap().insert(full_addr.clone());
-
-                        let (needs_sync, my_genesis, my_height, process_block) = {
-                            let chain = blockchain_clone.lock().unwrap(); 
-                            let my_height = chain.chain.len() as u64;
-                            let my_genesis = chain.chain[0].header.hash.clone();
-                            
-                            (block.header.index > my_height, my_genesis, my_height, block.header.index == my_height)
-                        }; 
-                        
-                        if needs_sync {
-                            println!("⏩ [P2P] Bloc du futur reçu ({}). Demande de mise à jour !", block.header.index);
-                            
-                            let envelope = P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port_clone.clone() };
-                            let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
-                            
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                            
-                            if let Some(P2PMessage::SyncResponse { blocks }) = read_p2p_message(&mut socket).await {
-                                println!("📦 [P2P] Réception de la chaîne de rattrapage ({} blocs) !", blocks.len());
-                                let mut chain = blockchain_clone.lock().unwrap(); 
-                                if chain.resolve_fork(blocks.clone()) { // 💡 FIX : On clone 'blocks' ici
-                                    println!("✅ [P2P] Synchronisation de rattrapage réussie !");
-                                    
-                                    // 🧹 NETTOYAGE ICI AUSSI !
-                                    let mut mp = mempool_clone.lock().unwrap();
-                                    mp.retain(|tx| {
-                                        !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == tx.kyber_capsule))
-                                    });
-                                }
-                            }
-                        } else if process_block {
-                            println!("\n🌍 [P2P] Nouveau BLOC {} reçu en direct !", block.header.index);
-                            let block_to_clean = block.clone(); 
-
-                            // 💡 NOUVEAU FIX : On enferme le Mutex dans un bloc !
-                            // Il mourra automatiquement à l'accolade fermante.
-                            let reject_info = {
-                                let mut chain = blockchain_clone.lock().unwrap();
-                                
-                                if let Err(e) = chain.validate_and_add_external_block(block.clone()) {
-                                    println!("   🚨 BLOC REJETÉ : {}", e);
-                                    let my_genesis = chain.chain[0].header.hash.clone();
-                                    let my_height = chain.chain.len() as u64;
-                                    // On retourne les infos pour envoyer l'erreur
-                                    Some((my_genesis, my_height))
-                                } else {
-                                    // Pas d'erreur, le bloc est validé !
-                                    None
-                                }
-                            }; // 🔓 Le MutexGuard `chain` est GARANTI détruit ici !
-
-                            // 🌐 Maintenant, on est libre de faire du réseau asynchrone (.await)
-                            if let Some((my_genesis, my_height)) = reject_info {
-                                // Le bloc a été rejeté, on prévient le mineur
-                                let envelope = P2PMessage::Handshake { 
-                                    genesis_hash: my_genesis, 
-                                    current_height: my_height, 
-                                    sender_port: my_port_clone.clone() 
-                                };
-                                let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
-                                
-                            } else {
-                                // Le bloc a été validé ! On nettoie et on propage.
-                                let mut mp = mempool_clone.lock().unwrap();
-                                let initial_len = mp.len();
-                                mp.retain(|tx| {
-                                    !block_to_clean.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == tx.kyber_capsule)
-                                });
-                                let removed = initial_len - mp.len();
-                                println!("🧹 [MEMPOOL] Nettoyé suite au bloc d'un pair. TX retirées : {}, restantes : {}", removed, mp.len());
-                                
-                                // 📢 LE RELAIS PROPAGE LE BLOC À TOUS LES AUTRES MINEURS !
-                                let peers_list = peers_clone.lock().unwrap().clone();
-                                for peer in peers_list {
-                                    if peer != full_addr {
-                                        let target_clone = peer.clone();
-                                        let block_clone = block_to_clean.clone();
-                                        let my_port_clone = my_port_clone.clone(); 
-                                        let p2p_chain_broadcast = Arc::clone(&blockchain_clone); 
-                                        
-                                        tokio::spawn(async move {
-                                            crate::network::broadcast_block(&target_clone, &my_port_clone, block_clone, p2p_chain_broadcast).await;
-                                        });
-                                    }
-                                }
-                            }
-                        } else {
-                            // 💡 NOUVEAU FIX : Le bloc est dans le passé ! Le mineur est sur une vieille branche (fork).
-                            // On lui envoie un Handshake en pleine tête pour le forcer à se mettre à jour !
-                            println!("🕰️ [P2P] Bloc obsolète reçu ({}). Le nœud {} est sur un fork, on le réveille !", block.header.index, sender_port);
-                            
-                            let (my_genesis, my_height) = {
-                                let chain_lock = blockchain_clone.lock().unwrap();
-                                (chain_lock.chain[0].header.hash.clone(), chain_lock.chain.len() as u64)
-                            };
-
-                            let envelope = P2PMessage::Handshake { 
-                                genesis_hash: my_genesis, 
-                                current_height: my_height, 
-                                sender_port: my_port_clone.clone() 
-                            };
-                            let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
-                        }
-                    },
-
-                    P2PMessage::WhisperTransaction { tx } => {
-                        let mut rng = rand::thread_rng();
-                        let dice_roll = rng.gen_range(1..=10); 
-                        if dice_roll <= 2 {
-                            println!("🌼 [DANDELION] Explosion du pissenlit ! Diffusion publique.");
-                            let mut pool = mempool_clone.lock().unwrap();
-                            pool.push(tx.clone());
-                        } else {
-                            println!("🤫 [DANDELION] Relais furtif de la TX...");
-                        }
-                    },
-
-                    P2PMessage::BroadcastTransaction { tx } => {
-                        if tx.is_valid() {
-                            let mut pool = mempool_clone.lock().unwrap();
-                            if !pool.iter().any(|t| t.dilithium_signature == tx.dilithium_signature) {
-                                println!("📥 [MEMPOOL] Nouvelle transaction publique reçue du réseau !");
-                                pool.push(tx.clone());
-                            }
-                        }
-                    },
-                    
-                    // 💡 NOUVEAU : Le serveur donne son Mempool quand on lui demande !
-                    P2PMessage::GetMempool => {
-                        let pool = mempool_clone.lock().unwrap().clone();
-                        let envelope = P2PMessage::MempoolSync { txs: pool };
-                        let _ = socket.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
-                    },
-                    
-                    // On ignore passivement si on le reçoit sans l'avoir demandé
-                    P2PMessage::MempoolSync { .. } => {},
-					
-					P2PMessage::BroadcastOrder { order } => {
-                        let mut pool = dex_pool_clone.lock().unwrap();
-                        if !pool.iter().any(|o| o.id == order.id) {
-                            println!("🌊 [P2P DEX] Ordre reçu du réseau : {} {} WATT", order.order_type, order.amount_flames);
-                            pool.push(order.clone());
-                        }
-                    },
-                }
-            }
-        });
-    }
-}
-
-// --- FONCTIONS RÉSEAU D'ENVOI ---
-
-pub async fn broadcast_block(target_peer: &str, my_port: &str, block: Block, blockchain: Arc<Mutex<Blockchain>>) {
-    let address = format_peer_address(target_peer);
-    
-    match TcpStream::connect(&address).await {
-        Ok(mut stream) => {
-            let envelope = P2PMessage::NewBlock { block, sender_port: my_port.to_string() };
-            let _ = stream.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
-
-            // On écoute la réponse du serveur
-            if let Some(P2PMessage::Handshake { current_height, .. }) = read_p2p_message(&mut stream).await {
-                
-                let (my_height, my_genesis) = {
-                    let chain = blockchain.lock().unwrap();
-                    (chain.chain.len() as u64, chain.chain[0].header.hash.clone())
-                };
-
-                if current_height > my_height {
-                    println!("⏩ [P2P] Oups, mon bloc a été refusé car je suis en retard ! (Réseau: {}, Moi: {})", current_height, my_height);
-                    
-                    // 💡 FIX : Le serveur a raccroché. On le RAPPELLE pour aspirer sa chaîne !
-                    let target_clone = target_peer.to_string();
-                    let my_port_clone = my_port.to_string();
-                    let chain_clone = Arc::clone(&blockchain);
-                    
-                    tokio::spawn(async move {
-                        // send_handshake va se connecter, demander la chaîne, la télécharger et faire le resolve_fork !
-                        crate::network::send_handshake(&target_clone, &my_port_clone, my_genesis, my_height, chain_clone).await;
-                    });
-
-                } else if current_height < my_height {
-                    println!("📡 [NAT] Le serveur est en retard (Hauteur: {}). Envoi de ma blockchain complète...", current_height);
-                    let blocks_to_send = {
-                        let chain = blockchain.lock().unwrap();
-                        chain.chain.clone()
+                        } else { None }
                     }; 
+
+                    if let Some(blocks) = blocks_to_send {
+                        send_message_to_channel(&tx, P2PMessage::SyncResponse { blocks }).await;
+                    }
+                },
+                
+                P2PMessage::SyncResponse { blocks } => {
+                    if blocks.is_empty() { continue; }
+                    let mut chain = blockchain.lock().unwrap(); 
+                    println!("📦 [P2P] Réception d'un Delta ({} blocs) !", blocks.len());
                     
-                    // 💡 Pareil ici, on ouvre une nouvelle connexion pour lui pousser les blocs
-                    let target_clone = target_peer.to_string();
-                    tokio::spawn(async move {
-                        let addr = format_peer_address(&target_clone);
-                        if let Ok(mut new_stream) = TcpStream::connect(&addr).await {
-                            let envelope_sync = P2PMessage::SyncResponse { blocks: blocks_to_send };
-                            let _ = new_stream.write_all(serde_json::to_string(&envelope_sync).unwrap().as_bytes()).await;
+                    if chain.resolve_partial_fork(blocks.clone()) { 
+                        println!("✅ Synchronisation partielle réussie ! Nous sommes à jour.");
+                        let mut mp = mempool.lock().unwrap();
+                        mp.retain(|tx| { !blocks.iter().any(|b| b.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == tx.kyber_capsule)) });
+                    }
+                },
+
+                P2PMessage::NewBlock { block, sender_port } => {
+                    let reject_info = {
+                        let mut chain = blockchain.lock().unwrap();
+                        if let Err(e) = chain.validate_and_add_external_block(block.clone()) {
+                            println!("   🚨 BLOC REJETÉ : {}", e);
+                            Some((chain.chain[0].header.hash.clone(), chain.chain.len() as u64))
+                        } else { None }
+                    };
+
+                    if let Some((my_genesis, my_height)) = reject_info {
+                        println!("🕰️ [P2P] Bloc obsolète. On réveille {} !", sender_port);
+                        send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port.clone() }).await;
+                    } else {
+                        println!("\n🌍 [P2P] Nouveau BLOC {} reçu en direct !", block.header.index);
+                        mempool.lock().unwrap().retain(|t| { !block.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == t.kyber_capsule) });
+                        
+                        // 📢 On propage ce bloc à TOUS nos autres tunnels !
+                        let env = P2PMessage::NewBlock { block: block.clone(), sender_port: my_port.clone() };
+                        let mut json_str = serde_json::to_string(&env).unwrap();
+                        json_str.push('\n');
+                        
+                        let ap = active_peers.lock().unwrap().clone();
+                        for (peer_id, sender) in ap.iter() {
+                            if peer_id != &actual_peer_id {
+                                let _ = sender.try_send(json_str.clone());
+                            }
                         }
-                    });
-                }
+                    }
+                },
+
+                P2PMessage::WhisperTransaction { tx: in_tx } => {
+                    let mut rng = rand::thread_rng();
+                    if rng.gen_range(1..=10) <= 2 {
+                        println!("🌼 [DANDELION] Explosion du pissenlit ! Diffusion publique.");
+                        mempool.lock().unwrap().push(in_tx);
+                    } else {
+                        println!("🤫 [DANDELION] Relais furtif de la TX...");
+                    }
+                },
+
+                P2PMessage::BroadcastTransaction { tx: in_tx } => {
+                    if in_tx.is_valid() {
+                        let mut pool = mempool.lock().unwrap();
+                        if !pool.iter().any(|t| t.dilithium_signature == in_tx.dilithium_signature) {
+                            println!("📥 [MEMPOOL] Nouvelle transaction publique reçue !");
+                            pool.push(in_tx);
+                        }
+                    }
+                },
+
+                P2PMessage::GetMempool => {
+                    let pool = mempool.lock().unwrap().clone();
+                    send_message_to_channel(&tx, P2PMessage::MempoolSync { txs: pool }).await;
+                },
+
+                P2PMessage::MempoolSync { txs } => {
+                    let mut local_mp = mempool.lock().unwrap();
+                    let chain = blockchain.lock().unwrap(); 
+                    let mut added = 0;
+                    for t in txs {
+                        if !local_mp.iter().any(|x| x.kyber_capsule == t.kyber_capsule) && !chain.spent_key_images.contains(&t.kyber_capsule) {
+                            local_mp.push(t);
+                            added += 1;
+                        }
+                    }
+                    if added > 0 { println!("📥 [PULL] {} transaction(s) aspirée(s) !", added); }
+                },
+
+                P2PMessage::BroadcastOrder { order } => {
+                    let mut pool = dex_pool.lock().unwrap();
+                    if !pool.iter().any(|o| o.id == order.id) {
+                        println!("🌊 [P2P DEX] Ordre reçu du réseau : {} {} WATT", order.order_type, order.amount_flames);
+                        pool.push(order);
+                    }
+                },
             }
-        },
-        Err(e) => {
-            println!("⚠️ [P2P] Impossible de joindre {} pour propager le bloc (Pare-feu ou Nœud hors ligne) : {}", address, e);
         }
+        
+        println!("🔌 [P2P] Connexion perdue avec {}.", actual_peer_id);
+        active_peers.lock().unwrap().remove(&actual_peer_id);
+    });
+}
+
+// --- FONCTIONS RÉSEAU POUR LE MINEUR ---
+
+// Ouvre le tunnel au démarrage du mineur
+pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Arc<Mutex<Blockchain>>, mempool: Arc<Mutex<Vec<Transaction>>>, dex_pool: SharedPool, known_peers: crate::SharedPeers, active_peers: ActivePeers) {
+    let address = if target_peer.contains(':') { target_peer.to_string() } else { format!("127.0.0.1:{}", target_peer) };
+    
+    if let Ok(socket) = TcpStream::connect(&address).await {
+        println!("🔗 [P2P] Tunnel connecté au réseau via {} !", address);
+        
+        let (my_genesis, my_height) = {
+            let chain = blockchain.lock().unwrap();
+            (chain.chain[0].header.hash.clone(), chain.chain.len() as u64)
+        };
+
+        start_peer_connection(
+            socket, address.clone(), my_port.to_string(), 
+            Arc::clone(&blockchain), Arc::clone(&mempool), Arc::clone(&dex_pool), 
+            Arc::clone(&known_peers), Arc::clone(&active_peers)
+        );
+
+        // 💡 FIX : On clone le sender dans un bloc isolé
+        let sender_opt = {
+            active_peers.lock().unwrap().get(&format!("{}:incoming", address)).cloned()
+        };
+
+        // 🔓 Le Mutex est fermé. On peut utiliser le sender cloné en mode asynchrone !
+        if let Some(sender) = sender_opt {
+            send_message_to_channel(&sender, P2PMessage::Handshake { 
+                genesis_hash: my_genesis, 
+                current_height: my_height, 
+                sender_port: my_port.to_string() 
+            }).await;
+        }
+    } else {
+        println!("⚠️ [P2P] Impossible de joindre le nœud de bootstrap {}.", address);
     }
 }
 
-pub async fn send_handshake(target_peer: &str, my_port: &str, genesis_hash: String, current_height: u64, blockchain: Arc<Mutex<Blockchain>>) {
-    let address = format_peer_address(target_peer);
-    if let Ok(mut stream) = TcpStream::connect(&address).await {
-        let envelope = P2PMessage::Handshake { genesis_hash, current_height, sender_port: my_port.to_string() };
-        let _ = stream.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
+// Diffuse le bloc dans TOUS les tunnels ouverts instantanément
+pub async fn broadcast_mined_block(my_port: &str, block: Block, active_peers: ActivePeers) {
+    let envelope = P2PMessage::NewBlock { block, sender_port: my_port.to_string() };
+    let mut json_str = serde_json::to_string(&envelope).unwrap();
+    json_str.push('\n');
 
-        if let Some(P2PMessage::SyncResponse { blocks }) = read_p2p_message(&mut stream).await {
-            println!("📦 [P2P] Réception de l'historique au démarrage ({} blocs) !", blocks.len());
-            let mut chain = blockchain.lock().unwrap();
-            if chain.resolve_fork(blocks) {
-                println!("✅ [P2P] Synchronisation de démarrage réussie !");
-            }
-        }
+    let peers = active_peers.lock().unwrap().clone();
+    for (peer_id, sender) in peers.iter() {
+        println!("🚀 Envoi du bloc dans le tunnel vers {}...", peer_id);
+        let _ = sender.try_send(json_str.clone());
+    }
+}
+
+// Diffuse une demande de Mempool dans TOUS les tunnels
+pub async fn request_mempool(active_peers: ActivePeers) {
+    let envelope = P2PMessage::GetMempool;
+    let mut json_str = serde_json::to_string(&envelope).unwrap();
+    json_str.push('\n');
+
+    let peers = active_peers.lock().unwrap().clone();
+    for (_, sender) in peers.iter() {
+        let _ = sender.try_send(json_str.clone());
     }
 }
 
 pub async fn broadcast_transaction(target_peer: &str, tx: Transaction) {
-    let address = format_peer_address(target_peer);
+    let address = if target_peer.contains(':') { target_peer.to_string() } else { format!("127.0.0.1:{}", target_peer) };
     if let Ok(mut stream) = TcpStream::connect(&address).await {
         let envelope = P2PMessage::BroadcastTransaction { tx };
-        let _ = stream.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
+        let mut json_str = serde_json::to_string(&envelope).unwrap();
+        json_str.push('\n'); // 💡 Indispensable pour le BufReader !
+        let _ = stream.write_all(json_str.as_bytes()).await;
     }
 }
 
 pub async fn broadcast_order(target_peer: &str, order: Order) {
-    let address = format_peer_address(target_peer);
+    let address = if target_peer.contains(':') { target_peer.to_string() } else { format!("127.0.0.1:{}", target_peer) };
     if let Ok(mut stream) = TcpStream::connect(&address).await {
         let envelope = P2PMessage::BroadcastOrder { order };
-        let _ = stream.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
-    }
-}
-
-fn format_peer_address(target: &str) -> String {
-    if target.contains(':') {
-        target.to_string() 
-    } else {
-        format!("127.0.0.1:{}", target) 
-    }
-}
-
-// 💡 MODIFICATION : On ajoute l'accès à la blockchain pour vérifier le registre noir
-pub async fn pull_mempool(target_peer: &str, mempool: Arc<Mutex<Vec<Transaction>>>, blockchain: Arc<Mutex<Blockchain>>) {
-    let address = format_peer_address(target_peer);
-    if let Ok(mut stream) = TcpStream::connect(&address).await {
-        
-        let envelope = P2PMessage::GetMempool;
-        let _ = stream.write_all(serde_json::to_string(&envelope).unwrap().as_bytes()).await;
-
-        if let Some(P2PMessage::MempoolSync { txs }) = read_p2p_message(&mut stream).await {
-            let mut local_mp = mempool.lock().unwrap();
-            let chain = blockchain.lock().unwrap(); // 🔒 On regarde le registre de la blockchain
-            
-            let mut added = 0;
-            
-            for tx in txs {
-                // 💡 FIX : On ne télécharge PAS si elle est déjà dans le mempool OU déjà dépensée !
-                if !local_mp.iter().any(|t| t.kyber_capsule == tx.kyber_capsule) 
-                   && !chain.spent_key_images.contains(&tx.kyber_capsule) 
-                {
-                    local_mp.push(tx);
-                    added += 1;
-                }
-            }
-            if added > 0 {
-                println!("📥 [PULL] {} transaction(s) aspirée(s) depuis le Relais !", added);
-            }
-        }
+        let mut json_str = serde_json::to_string(&envelope).unwrap();
+        json_str.push('\n');
+        let _ = stream.write_all(json_str.as_bytes()).await;
     }
 }
