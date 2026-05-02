@@ -178,7 +178,11 @@ fn start_peer_connection(
                         println!("🕰️ [P2P] Bloc obsolète. On réveille {} !", sender_port);
                         send_message_to_channel(&tx, P2PMessage::Handshake { genesis_hash: my_genesis, current_height: my_height, sender_port: my_port.clone() }).await;
                     } else {
-                        println!("\n🌍 [P2P] Nouveau BLOC {} reçu en direct !", block.header.index);
+                        println!("\n====================================================================");
+						println!("🌍 [RÉSEAU] NOUVEAU BLOC {} REÇU ! (Source: {})", block.header.index, sender_port);
+						println!("🔗 Hash: {}", block.header.hash);
+						println!("====================================================================");
+						println!("✅ Bloc {} validé et ajouté à la chaîne locale.", block.header.index);
                         mempool.lock().unwrap().retain(|t| { !block.transactions.iter().any(|mined_tx| mined_tx.kyber_capsule == t.kyber_capsule) });
                         
                         // 📢 On propage ce bloc à TOUS nos autres tunnels !
@@ -269,10 +273,10 @@ pub async fn connect_to_network(target_peer: &str, my_port: &str, blockchain: Ar
         );
 
         // 💡 FIX : On clone le sender dans un bloc isolé
-        let sender_opt = {
-            active_peers.lock().unwrap().get(&format!("{}:incoming", address)).cloned()
-        };
-
+        let ip_only = address.split(':').next().unwrap_or(&address).to_string();
+		let sender_opt = {
+			active_peers.lock().unwrap().get(&format!("{}:incoming", ip_only)).cloned()
+		};
         // 🔓 Le Mutex est fermé. On peut utiliser le sender cloné en mode asynchrone !
         if let Some(sender) = sender_opt {
             send_message_to_channel(&sender, P2PMessage::Handshake { 
