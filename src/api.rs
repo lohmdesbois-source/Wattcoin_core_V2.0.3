@@ -42,33 +42,36 @@ pub async fn start_api_server(
     mempool: Arc<Mutex<Vec<Transaction>>>, 
     chain: Arc<Mutex<Blockchain>>, 
     known_peers: crate::SharedPeers, 
-    dex_pool: SharedPool
+    dex_pool: SharedPool,
+	active_peers: crate::network::ActivePeers
 ) {
     let mempool_filter = warp::any().map(move || Arc::clone(&mempool));
     let chain_filter = warp::any().map(move || Arc::clone(&chain));
     let dex_pool_filter = warp::any().map(move || Arc::clone(&dex_pool));
     let peers_filter = warp::any().map(move || Arc::clone(&known_peers));
 
+    // 💡 Le filtre pour passer les tunnels à nos routes
+    let active_peers_filter = warp::any().map(move || Arc::clone(&active_peers));
+
     // 1. ROUTE : RECEVOIR UNE TRANSACTION WATTCOIN
     let send_tx = warp::post()
         .and(warp::path("send_tx"))
         .and(warp::body::json())
         .and(mempool_filter.clone())
-        .and(peers_filter.clone())
-        .map(|tx: Transaction, mempool: Arc<Mutex<Vec<Transaction>>>, peers: crate::SharedPeers| {
+        .and(active_peers_filter.clone()) // 💡 On utilise les tunnels
+        .map(|tx: Transaction, mempool: Arc<Mutex<Vec<Transaction>>>, active_peers: crate::network::ActivePeers| {
             if tx.is_valid() {
                 let mut pool = mempool.lock().unwrap();
                 if !pool.iter().any(|t| t.kyber_capsule == tx.kyber_capsule) {
                     pool.push(tx.clone());
                     println!("📥 [API] Nouvelle TX ajoutée au Mempool !");
 
-                    let peers_list = peers.lock().unwrap().clone();
-                    for peer in peers_list {
-                        let tx_to_broadcast = tx.clone();
-                        tokio::spawn(async move {
-                            crate::network::broadcast_transaction(&peer, tx_to_broadcast).await;
-                        });
-                    }
+                    // ⚡ PUSH INSTANTANÉ
+                    let tx_clone = tx.clone();
+                    tokio::spawn(async move {
+                        crate::network::broadcast_transaction(tx_clone, active_peers).await;
+                    });
+                    
                     warp::reply::with_status(warp::reply::json(&"✅ TX acceptée"), warp::http::StatusCode::OK)
                 } else {
                     warp::reply::with_status(warp::reply::json(&"⚠️ Déjà dans le mempool"), warp::http::StatusCode::BAD_REQUEST)
@@ -112,13 +115,13 @@ pub async fn start_api_server(
             warp::reply::json(&orders)
         });
 
-    // 4. ROUTE : SOUMETTRE UN ORDRE (ACHAT/VENTE)
+    // 4. ROUTE : SOUMETTRE UN ORDRE DEX
     let submit_order = warp::post()
         .and(warp::path("order"))
         .and(warp::body::json())
         .and(dex_pool_filter.clone())
-        .and(peers_filter.clone())
-        .map(|order: Order, pool: SharedPool, peers: crate::SharedPeers| {
+        .and(active_peers_filter.clone()) // 💡 On utilise les tunnels
+        .map(|order: Order, pool: SharedPool, active_peers: crate::network::ActivePeers| {
             println!("📡 [API DEX] Ordre reçu du Wallet : {} {} WATT", order.order_type, order.amount_flames);
             
             let mut is_new = false;
@@ -131,13 +134,11 @@ pub async fn start_api_server(
             }
 
             if is_new {
-                let peers_list = peers.lock().unwrap().clone();
-                for peer in peers_list {
-                    let order_clone = order.clone();
-                    tokio::spawn(async move {
-                        crate::network::broadcast_order(&peer, order_clone).await;
-                    });
-                }
+                // ⚡ PUSH INSTANTANÉ
+                let order_clone = order.clone();
+                tokio::spawn(async move {
+                    crate::network::broadcast_order(order_clone, active_peers).await;
+                });
             }
             warp::reply::json(&"Ordre ajouté et propagé")
         });

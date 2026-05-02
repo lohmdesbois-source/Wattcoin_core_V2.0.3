@@ -79,7 +79,8 @@ async fn main() {
     let api_mempool = Arc::clone(&mempool);
     let api_peers = Arc::clone(&known_peers); 
     let api_dex_pool = Arc::clone(&dex_pool); // 💡 FIX : On clone le pool DEX avant de l'envoyer dans le thread !
-    tokio::spawn(async move { api::start_api_server(api_port, api_bind_ip, api_mempool, api_chain, api_peers, api_dex_pool).await; });
+	let api_active_peers = Arc::clone(&active_peers);
+    tokio::spawn(async move { api::start_api_server(api_port, api_bind_ip, api_mempool, api_chain, api_peers, api_dex_pool, api_active_peers).await; });
 
     // 🤝 3. OUVERTURE DU TUNNEL VERS LE BOOTSTRAP
     if let Some(target) = &peer_target {
@@ -118,10 +119,6 @@ async fn main() {
 
         println!("\n⛏️  Début de l'extraction pour l'adresse : {}...", miner_address);
         loop {
-            // 💡 On demande un rafraichissement du Mempool via nos tunnels ouverts
-            if peer_target.is_some() {
-                network::request_mempool(Arc::clone(&active_peers)).await;
-            }
 
             // --- ÉTAPE A : PRÉPARER LE BLOC ---
             let (mut candidate_block, target) = {

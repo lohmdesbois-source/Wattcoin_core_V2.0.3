@@ -303,34 +303,28 @@ pub async fn broadcast_mined_block(my_port: &str, block: Block, active_peers: Ac
     }
 }
 
-// Diffuse une demande de Mempool dans TOUS les tunnels
-pub async fn request_mempool(active_peers: ActivePeers) {
-    let envelope = P2PMessage::GetMempool;
+// 💡 NOUVEAU : On diffuse la TX instantanément dans les tunnels (Fini les nouvelles connexions !)
+pub async fn broadcast_transaction(tx: Transaction, active_peers: ActivePeers) {
+    let envelope = P2PMessage::BroadcastTransaction { tx };
     let mut json_str = serde_json::to_string(&envelope).unwrap();
     json_str.push('\n');
 
     let peers = active_peers.lock().unwrap().clone();
-    for (_, sender) in peers.iter() {
+    for (peer_id, sender) in peers.iter() {
+        println!("🚀 Envoi de la TX dans le tunnel vers {}...", peer_id);
         let _ = sender.try_send(json_str.clone());
     }
 }
 
-pub async fn broadcast_transaction(target_peer: &str, tx: Transaction) {
-    let address = if target_peer.contains(':') { target_peer.to_string() } else { format!("127.0.0.1:{}", target_peer) };
-    if let Ok(mut stream) = TcpStream::connect(&address).await {
-        let envelope = P2PMessage::BroadcastTransaction { tx };
-        let mut json_str = serde_json::to_string(&envelope).unwrap();
-        json_str.push('\n'); // 💡 Indispensable pour le BufReader !
-        let _ = stream.write_all(json_str.as_bytes()).await;
-    }
-}
+// 💡 NOUVEAU : Pareil pour les ordres DEX, temps réel absolu !
+pub async fn broadcast_order(order: Order, active_peers: ActivePeers) {
+    let envelope = P2PMessage::BroadcastOrder { order };
+    let mut json_str = serde_json::to_string(&envelope).unwrap();
+    json_str.push('\n');
 
-pub async fn broadcast_order(target_peer: &str, order: Order) {
-    let address = if target_peer.contains(':') { target_peer.to_string() } else { format!("127.0.0.1:{}", target_peer) };
-    if let Ok(mut stream) = TcpStream::connect(&address).await {
-        let envelope = P2PMessage::BroadcastOrder { order };
-        let mut json_str = serde_json::to_string(&envelope).unwrap();
-        json_str.push('\n');
-        let _ = stream.write_all(json_str.as_bytes()).await;
+    let peers = active_peers.lock().unwrap().clone();
+    for (peer_id, sender) in peers.iter() {
+        println!("🚀 Envoi de l'Ordre DEX dans le tunnel vers {}...", peer_id);
+        let _ = sender.try_send(json_str.clone());
     }
 }
